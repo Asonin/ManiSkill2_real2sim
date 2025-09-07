@@ -401,6 +401,7 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
     def evaluate(self, **kwargs):
         # evaluate the success of the task
 
+        #有没有抓住
         is_grasped = self.agent.check_grasp(self.obj, max_angle=80)
         if is_grasped:
             self.consecutive_grasp += 1
@@ -408,9 +409,15 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
             self.consecutive_grasp = 0
             self.lifted_obj = False
 
+        #接触位置，以及检查这里是不是立起来了
         contacts = self._scene.get_contacts()
         flag = True
         robot_link_names = [x.name for x in self.agent.robot.get_links()]
+        
+        # 这个是用来存grap info的
+        contact_point_data = []  # 每个元素是 [x, y, z, imp_x, imp_y, imp_z]
+        total_contact_impulse = np.zeros(3)
+
         for contact in contacts:
             actor_0, actor_1 = contact.actor0, contact.actor1
             other_obj_contact_actor_name = None
@@ -418,6 +425,7 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
                 other_obj_contact_actor_name = actor_1.name
             elif actor_1.name == self.obj.name:
                 other_obj_contact_actor_name = actor_0.name
+
             if other_obj_contact_actor_name is not None:
                 # the object is in contact with an actor
                 contact_impulse = np.sum(
@@ -431,10 +439,41 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
                     flag = False
                     break
 
+                impulses = [point.impulse for point in contact.points]
+                positions = [point.position for point in contact.points]
+
+                # 收集每个 contact point 的坐标 + impulse
+                for pos, imp in zip(positions, impulses):
+                    contact_point_data.append(np.concatenate([pos, imp], axis=0))  # shape (6,)
+                total_contact_impulse += contact_impulse
+
+        
+        #是不是连续接触
         consecutive_grasp = self.consecutive_grasp >= 5
         diff_obj_height = self.obj.pose.p[2] - self.obj_height_after_settle
+        #有没有被立起来
         self.lifted_obj = self.lifted_obj or (flag and (diff_obj_height > 0.01))
         lifted_object_significantly = self.lifted_obj and (diff_obj_height > 0.02)
+
+        # 1. 所有 contact point 的数据 (N, 6)
+        if contact_point_data:
+            contact_point_array = np.stack(contact_point_data, axis=0)  # shape (N, 6)
+        else:
+            contact_point_array = np.zeros((0, 6))  # 空的 fallback
+
+        # 2. 总冲量 (3,) + lifted 状态 (1,)
+        total_impulse_and_lift = np.concatenate([total_contact_impulse, [float(self.lifted_obj)]], axis=0)  # shape (4,)
+        padded_total_row = np.pad(total_impulse_and_lift, (0, 2), mode='constant')  # shape: (6,)
+
+        # 拼接
+        if contact_point_array.shape[0] > 0:
+            full_array = np.vstack([contact_point_array, padded_total_row[None, :]])  # shape (N+1, 6)
+        else:
+            full_array = padded_total_row[None, :]  # shape (1, 6)
+        # 3. 合并为一个 tensor（N 行 contact point，最后一行是总冲量 + lifted）
+        # full_array = np.vstack([contact_point_array, total_impulse_and_lift[None, :]]) if contact_point_array.shape[0] > 0 else total_impulse_and_lift[None, :]
+
+        # contact_tensor = torch.tensor(full_array, dtype=torch.float32)
 
         if self.require_lifting_obj_for_success:
             success = self.lifted_obj
@@ -458,6 +497,7 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
             lifted_object_significantly=lifted_object_significantly,
             success=success,
             episode_stats=self.episode_stats,
+            contact_tensor=full_array,
         )
 
 
@@ -470,7 +510,7 @@ class GraspSingleInSceneEnv(CustomSceneEnv):
 class GraspSingleCustomInSceneEnv(GraspSingleInSceneEnv, CustomOtherObjectsInSceneEnv):
     def _load_model(self):
         density = self.model_db[self.model_id].get("density", 1000)
-
+        #这里是创建obj
         self.obj = self._build_actor_helper(
             self.model_id,
             self._scene,
@@ -617,7 +657,7 @@ class GraspSingleCokeCanInSceneEnv(GraspSingleCustomOrientationInSceneEnv):
         kwargs["model_ids"] = ["coke_can"]
         super().__init__(**kwargs)
 
-
+#这是目前我们用的，我们要从中取出一些spatial和labeling信息供我们的probing使用
 @register_env("GraspSingleOpenedCokeCanInScene-v0", max_episode_steps=80)
 class GraspSingleOpenedCokeCanInSceneEnv(GraspSingleCustomOrientationInSceneEnv):
     """
